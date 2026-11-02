@@ -62,6 +62,7 @@ use crate::logic::ast::{
     RightKind, RuleDecl, SetKind, Unit, Value, WireDecl, clock_text, duration_value,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use unicode_normalization::char::decompose_canonical;
 
 mod exprs;
 
@@ -2273,8 +2274,9 @@ impl SlugTable {
 }
 
 /// Turn a display title into a valid Lox Logic slug (`[a-z][a-z0-9_]*`).
-/// German umlauts transliterate (`ü`→`ue`); everything else non-alphanumeric
-/// collapses to `_`.
+/// German umlauts transliterate (`ü`→`ue`), other Latin letters lose their
+/// accents (`ž`→`z`), and everything else collapses to `_`. Composed and
+/// decomposed accents give the same slug.
 pub fn slugify(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
@@ -2283,12 +2285,11 @@ pub fn slugify(name: &str) -> String {
             'ö' | 'Ö' => out.push_str("oe"),
             'ü' | 'Ü' => out.push_str("ue"),
             'ß' => out.push_str("ss"),
-            c if c.is_ascii_alphanumeric() => out.push(c.to_ascii_lowercase()),
-            _ => {
-                if !out.ends_with('_') && !out.is_empty() {
-                    out.push('_');
-                }
-            }
+            // A decomposed umlaut: `u` followed by U+0308.
+            '\u{308}' if out.ends_with(['a', 'o', 'u']) => out.push('e'),
+            c if is_diacritic(c) => {}
+            c if c.is_ascii() => push_slug_char(&mut out, c),
+            c => push_latin(&mut out, c),
         }
     }
     let out = out.trim_matches('_').to_string();
@@ -2297,6 +2298,68 @@ pub fn slugify(name: &str) -> String {
         Some(_) => format!("x{out}"),
         None => "x".to_string(),
     }
+}
+
+/// An ASCII letter or digit goes in lowercased; anything else is one `_`.
+fn push_slug_char(out: &mut String, c: char) {
+    if c.is_ascii_alphanumeric() {
+        out.push(c.to_ascii_lowercase());
+    } else if !out.ends_with('_') && !out.is_empty() {
+        out.push('_');
+    }
+}
+
+/// A Latin letter without its accents: the base letter of its Unicode
+/// decomposition (`ž` is `z` + caron), or its spelling when it has none
+/// (`ł`→`l`). Anything else is one `_`.
+fn push_latin(out: &mut String, c: char) {
+    let mut base = None;
+    decompose_canonical(c, |d| {
+        if !is_diacritic(d) {
+            base.get_or_insert(d);
+        }
+    });
+    match base {
+        Some(b) if b.is_ascii() => push_slug_char(out, b),
+        _ => match undecomposed_latin(c) {
+            Some(s) => out.push_str(s),
+            None => push_slug_char(out, c),
+        },
+    }
+}
+
+/// The Combining Diacritical Marks blocks: every mark that a letter with an
+/// ASCII base decomposes into is in one of them.
+fn is_diacritic(c: char) -> bool {
+    matches!(
+        c,
+        '\u{300}'..='\u{36f}'
+            | '\u{1ab0}'..='\u{1aff}'
+            | '\u{1dc0}'..='\u{1dff}'
+            | '\u{20d0}'..='\u{20ff}'
+            | '\u{fe20}'..='\u{fe2f}'
+    )
+}
+
+/// The Latin letters that have no decomposition.
+fn undecomposed_latin(c: char) -> Option<&'static str> {
+    Some(match c {
+        'æ' | 'Æ' => "ae",
+        'ð' | 'Ð' | 'đ' | 'Đ' => "d",
+        'ħ' | 'Ħ' => "h",
+        'ı' => "i",
+        'ĳ' | 'Ĳ' => "ij",
+        'ĸ' => "k",
+        'ł' | 'Ł' | 'ŀ' | 'Ŀ' => "l",
+        'ŉ' => "n",
+        'ŋ' | 'Ŋ' => "ng",
+        'ø' | 'Ø' => "o",
+        'œ' | 'Œ' => "oe",
+        'ſ' => "s",
+        'ŧ' | 'Ŧ' => "t",
+        'þ' | 'Þ' => "th",
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -2310,6 +2373,59 @@ mod tests {
         assert_eq!(slugify("3. OG Licht"), "x3_og_licht");
         assert_eq!(slugify("Größe"), "groesse");
         assert_eq!(slugify("---"), "x");
+        // Other Latin letters lose their accents.
+        assert_eq!(slugify("Ložnice"), "loznice");
+        assert_eq!(slugify("Večerní režim"), "vecerni_rezim");
+        assert_eq!(slugify("Čas"), "cas");
+        assert_eq!(slugify("01.Ložnice"), "x01_loznice");
+        assert_eq!(slugify("Éclairage salon"), "eclairage_salon");
+        assert_eq!(slugify("Ação"), "acao");
+        assert_eq!(slugify("Đèn phòng khách"), "den_phong_khach");
+        // Latin letters with no decomposition.
+        assert_eq!(slugify("Łazienka"), "lazienka");
+        assert_eq!(slugify("Kjøkken"), "kjokken");
+        assert_eq!(slugify("Işık"), "isik");
+        // Symbols and other scripts stay separators.
+        assert_eq!(slugify("Temp °C"), "temp_c");
+        assert_eq!(slugify("Licht™"), "licht");
+        assert_eq!(slugify("Свет"), "x");
+    }
+
+    #[test]
+    fn slugify_ignores_the_unicode_form() {
+        // Decomposed (NFD): the base letter, then a combining mark.
+        assert_eq!(slugify("Loz\u{30c}nice"), "loznice");
+        assert_eq!(slugify("Beschattung Su\u{308}d"), "beschattung_sued");
+        assert_eq!(slugify("A\u{308}nderung"), "aenderung");
+        assert_eq!(slugify("Gro\u{308}\u{df}e"), "groesse");
+        // The German rule is for umlauts only.
+        assert_eq!(slugify("Citroe\u{308}n"), "citroen");
+    }
+
+    #[test]
+    fn slugify_spells_every_latin_letter() {
+        // Latin-1 Supplement and Latin Extended-A.
+        for c in ('\u{c0}'..='\u{17f}').filter(|c| c.is_alphabetic()) {
+            let s = slugify(&c.to_string());
+            assert!(
+                s != "x" && s.bytes().all(|b| b.is_ascii_lowercase()),
+                "{c} gives `{s}`"
+            );
+        }
+    }
+
+    #[test]
+    fn letters_with_an_ascii_base_decompose_into_diacritics() {
+        for c in (0..=0x10ffff).filter_map(char::from_u32) {
+            let mut parts = Vec::new();
+            decompose_canonical(c, |d| parts.push(d));
+            if parts.len() > 1 && parts[0].is_ascii_alphabetic() {
+                assert!(
+                    parts[1..].iter().all(|&d| is_diacritic(d)),
+                    "{c} decomposes into {parts:?}"
+                );
+            }
+        }
     }
 
     #[test]
