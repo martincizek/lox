@@ -1,0 +1,1 @@
+- **`loxl decompile`** and **`loxl adopt`** keep accented Latin letters in the names they make from titles: `Ložnice` becomes `loznice` and the page file `x01_loznice.loxl`, not `lo_nice`. Composed and decomposed accents give the same name. Names already in a module stay as they are.
